@@ -18,6 +18,7 @@ import (
 	"github.com/hashicorp/terraform-plugin-framework/schema/validator"
 	"github.com/hashicorp/terraform-plugin-framework/types"
 	"github.com/hashicorp/terraform-plugin-log/tflog"
+	"github.com/microsoft/kiota-abstractions-go/serialization"
 	msgraphsdk "github.com/microsoftgraph/msgraph-beta-sdk-go"
 	graphmodels "github.com/microsoftgraph/msgraph-beta-sdk-go/models"
 )
@@ -294,8 +295,10 @@ func newPrivilegedAccessGroupEligibilityScheduleRequest(data GroupEligibleAssign
 
 	scheduleInfo.SetStartDateTime(&startDateTime)
 	expiration := graphmodels.NewExpirationPattern()
-	typ := graphmodels.NOEXPIRATION_EXPIRATIONPATTERNTYPE
+	typ := graphmodels.AFTERDURATION_EXPIRATIONPATTERNTYPE
 	expiration.SetTypeEscaped(&typ)
+	dur := 180 * 24 * time.Hour
+	expiration.SetDuration(serialization.FromDuration(dur))
 
 	scheduleInfo.SetExpiration(expiration)
 	requestBody.SetScheduleInfo(scheduleInfo)
