@@ -19,7 +19,6 @@ import (
 	"github.com/hashicorp/terraform-plugin-framework/types"
 	"github.com/hashicorp/terraform-plugin-log/tflog"
 	msgraphsdk "github.com/microsoftgraph/msgraph-beta-sdk-go"
-	"github.com/microsoftgraph/msgraph-beta-sdk-go/identitygovernance"
 	graphmodels "github.com/microsoftgraph/msgraph-beta-sdk-go/models"
 )
 
@@ -36,16 +35,6 @@ type GroupEligibleAssignment struct {
 	graphClient *msgraphsdk.GraphServiceClient
 }
 
-type Schedule struct {
-	StartDateTime types.String `tfsdk:"start_date_time"`
-	Expiration    Expiration   `tfsdk:"expiration"`
-}
-
-type Expiration struct {
-	Type        types.String `tfsdk:"type"`
-	EndDateTime types.String `tfsdk:"end_date_time"`
-}
-
 // GroupEligibleAssignmentModel describes the resource data model.
 type GroupEligibleAssignmentModel struct {
 	Id            types.String `tfsdk:"id"`
@@ -54,7 +43,7 @@ type GroupEligibleAssignmentModel struct {
 	Justification types.String `tfsdk:"justification"`
 	PrincipalID   types.String `tfsdk:"principal_id"`
 	Status        types.String `tfsdk:"status"`
-	Schedule      Schedule     `tfsdk:"schedule"`
+	StartDateTime types.String `tfsdk:"start_date_time"`
 }
 
 func (r *GroupEligibleAssignment) Metadata(ctx context.Context, req resource.MetadataRequest, resp *resource.MetadataResponse) {
@@ -69,7 +58,7 @@ func (r *GroupEligibleAssignment) Schema(ctx context.Context, req resource.Schem
 		Attributes: map[string]schema.Attribute{
 			"id": schema.StringAttribute{
 				Computed:            true,
-				MarkdownDescription: "Identifier",
+				MarkdownDescription: "The ID of the resource is the targetScheduleId value.",
 				PlanModifiers: []planmodifier.String{
 					stringplanmodifier.UseStateForUnknown(),
 				},
@@ -108,35 +97,8 @@ func (r *GroupEligibleAssignment) Schema(ctx context.Context, req resource.Schem
 			"status": schema.StringAttribute{
 				Computed: true,
 			},
-		},
-		Blocks: map[string]schema.Block{
-			"schedule": schema.SingleNestedBlock{
-				Attributes: map[string]schema.Attribute{
-					"start_date_time": schema.StringAttribute{
-						Required: true,
-						PlanModifiers: []planmodifier.String{
-							stringplanmodifier.RequiresReplace(),
-						},
-					},
-				},
-				Blocks: map[string]schema.Block{
-					"expiration": schema.SingleNestedBlock{
-						Attributes: map[string]schema.Attribute{
-							"type": schema.StringAttribute{
-								Required: true,
-								PlanModifiers: []planmodifier.String{
-									stringplanmodifier.RequiresReplace(),
-								},
-							},
-							"end_date_time": schema.StringAttribute{
-								Required: true,
-								PlanModifiers: []planmodifier.String{
-									stringplanmodifier.RequiresReplace(),
-								},
-							},
-						},
-					},
-				},
+			"start_date_time": schema.StringAttribute{
+				Computed: true,
 			},
 		},
 	}
@@ -168,42 +130,13 @@ func (r *GroupEligibleAssignment) Create(ctx context.Context, req resource.Creat
 		return
 	}
 
-	requestBody := graphmodels.NewPrivilegedAccessGroupEligibilityScheduleRequest()
+	data.StartDateTime = types.StringValue(time.Now().Format(time.RFC3339))
 
-	accessId := graphmodels.MEMBER_PRIVILEGEDACCESSGROUPRELATIONSHIPS
-	requestBody.SetAccessId(&accessId)
-
-	principalId := data.PrincipalID.ValueString()
-	requestBody.SetPrincipalId(&principalId)
-
-	groupId := data.Scope.ValueString()
-	requestBody.SetGroupId(&groupId)
-
-	action := graphmodels.ADMINASSIGN_SCHEDULEREQUESTACTIONS
-	requestBody.SetAction(&action)
-
-	scheduleInfo := graphmodels.NewRequestSchedule()
-	startDateTime, err := time.Parse(time.RFC3339, data.Schedule.StartDateTime.ValueString())
+	requestBody, err := newPrivilegedAccessGroupEligibilityScheduleRequest(data)
 	if err != nil {
-		resp.Diagnostics.AddError("Client Error", "Unable to parse startDateTime")
+		resp.Diagnostics.AddError("Client Error", "Unable to create eligibility schedule requests: "+err.Error())
 		return
 	}
-	scheduleInfo.SetStartDateTime(&startDateTime)
-	expiration := graphmodels.NewExpirationPattern()
-	typ := graphmodels.AFTERDATETIME_EXPIRATIONPATTERNTYPE
-	expiration.SetTypeEscaped(&typ)
-
-	endDateTime, err := time.Parse(time.RFC3339, data.Schedule.Expiration.EndDateTime.ValueString())
-	if err != nil {
-		resp.Diagnostics.AddError("Client Error", "Unable to parse endDateTime")
-		return
-	}
-
-	expiration.SetEndDateTime(&endDateTime)
-	scheduleInfo.SetExpiration(expiration)
-	requestBody.SetScheduleInfo(scheduleInfo)
-	justification := "Assign eligible request."
-	requestBody.SetJustification(&justification)
 
 	eligibilityScheduleRequests, err := r.graphClient.
 		IdentityGovernance().
@@ -212,16 +145,11 @@ func (r *GroupEligibleAssignment) Create(ctx context.Context, req resource.Creat
 		EligibilityScheduleRequests().
 		Post(context.Background(), requestBody, nil)
 	if err != nil {
-		resp.Diagnostics.AddError("Client Error", "Unable to create eligibility schedule requests")
+		resp.Diagnostics.AddError("Client Error", "Unable to create eligibility schedule requests: "+err.Error())
 		return
 	}
 
-	id := eligibilityScheduleRequests.GetTargetScheduleId()
-	if id == nil {
-		resp.Diagnostics.AddError("Client Error", "Unable to get eligibility schedule requests ID")
-		return
-	}
-	data.Id = types.StringValue(*id)
+	data.Id = types.StringValue(*eligibilityScheduleRequests.GetId())
 
 	status := eligibilityScheduleRequests.GetStatus()
 	if status == nil {
@@ -229,6 +157,16 @@ func (r *GroupEligibleAssignment) Create(ctx context.Context, req resource.Creat
 		return
 	}
 	data.Status = types.StringValue(*status)
+	data.Justification = types.StringValue(*eligibilityScheduleRequests.GetJustification())
+	data.PrincipalID = types.StringValue(*eligibilityScheduleRequests.GetPrincipalId())
+	role, err := convertAccessIdToRole(*eligibilityScheduleRequests.GetAccessId())
+	if err != nil {
+		resp.Diagnostics.AddError("Client Error", "Unable to convert access ID to role: "+err.Error())
+		return
+	}
+	data.Role = types.StringValue(role)
+	data.Scope = types.StringValue(*eligibilityScheduleRequests.GetGroupId())
+	data.StartDateTime = types.StringValue(eligibilityScheduleRequests.GetScheduleInfo().GetStartDateTime().Format(time.RFC3339))
 
 	tflog.Trace(ctx, "created a resource")
 
@@ -246,29 +184,32 @@ func (r *GroupEligibleAssignment) Read(ctx context.Context, req resource.ReadReq
 		return
 	}
 
-	requestFilter := fmt.Sprintf(
-		"groupId eq '%s' and principalId eq '%s' and accessId eq '%s'",
-		data.Scope.ValueString(),
-		data.PrincipalID.ValueString(),
-		data.Role.ValueString(),
-	)
-
 	groupEligibleResp, err := r.graphClient.
 		IdentityGovernance().
 		PrivilegedAccess().
 		Group().
 		EligibilityScheduleRequests().
-		Get(context.Background(), &identitygovernance.PrivilegedAccessGroupEligibilityScheduleRequestsRequestBuilderGetRequestConfiguration{
-			QueryParameters: &identitygovernance.PrivilegedAccessGroupEligibilityScheduleRequestsRequestBuilderGetQueryParameters{
-				Filter: &requestFilter,
-			},
-		})
+		ByPrivilegedAccessGroupEligibilityScheduleRequestId(data.Id.ValueString()).
+		Get(context.Background(), nil)
 	if err != nil {
-		resp.Diagnostics.AddError("Client Error", "Unable to get eligibility schedule requests")
+		resp.Diagnostics.AddError("Client call failed", "Unable to get eligibility schedule requests: "+err.Error())
 		return
 	}
 
-	fmt.Println("read response", groupEligibleResp)
+	data.Id = types.StringValue(*groupEligibleResp.GetId())
+	data.Justification = types.StringValue(*groupEligibleResp.GetJustification())
+	data.Status = types.StringValue(*groupEligibleResp.GetStatus())
+	data.PrincipalID = types.StringValue(*groupEligibleResp.GetPrincipalId())
+
+	role, err := convertAccessIdToRole(*groupEligibleResp.GetAccessId())
+	if err != nil {
+		resp.Diagnostics.AddError("Conversion failed", "Unable to convert access ID to role: "+err.Error())
+		return
+	}
+	data.Role = types.StringValue(role)
+
+	data.Scope = types.StringValue(*groupEligibleResp.GetGroupId())
+	data.StartDateTime = types.StringValue(groupEligibleResp.GetScheduleInfo().GetStartDateTime().Format(time.RFC3339))
 
 	// Save updated data into Terraform state
 	resp.Diagnostics.Append(resp.State.Set(ctx, &data)...)
@@ -284,7 +225,7 @@ func (r *GroupEligibleAssignment) Update(ctx context.Context, req resource.Updat
 		return
 	}
 
-	tflog.Error(ctx, "update not implemented")
+	tflog.Info(ctx, "resource can only be replaced")
 
 	// Save updated data into Terraform state
 	resp.Diagnostics.Append(resp.State.Set(ctx, &data)...)
@@ -300,9 +241,91 @@ func (r *GroupEligibleAssignment) Delete(ctx context.Context, req resource.Delet
 		return
 	}
 
-	tflog.Error(ctx, "delete not implemented")
+	requestBody, err := newPrivilegedAccessGroupEligibilityScheduleRequest(data)
+	if err != nil {
+		resp.Diagnostics.AddError("Error deleting resource", "Unable to create eligibility schedule request: "+err.Error())
+		return
+	}
+
+	requestBody.SetAction(toPtr(graphmodels.ADMINREMOVE_SCHEDULEREQUESTACTIONS))
+	requestBody.SetId(toPtr(data.Id.ValueString()))
+
+	_, err = r.graphClient.
+		IdentityGovernance().
+		PrivilegedAccess().
+		Group().
+		EligibilityScheduleRequests().
+		Post(ctx, requestBody, nil)
+
+	if err != nil {
+		resp.Diagnostics.AddError("Error deleting resource", "Unable to delete eligibility schedule request: "+err.Error())
+		return
+	}
 }
 
 func (r *GroupEligibleAssignment) ImportState(ctx context.Context, req resource.ImportStateRequest, resp *resource.ImportStateResponse) {
 	resource.ImportStatePassthroughID(ctx, path.Root("id"), req, resp)
+}
+
+func newPrivilegedAccessGroupEligibilityScheduleRequest(data GroupEligibleAssignmentModel) (*graphmodels.PrivilegedAccessGroupEligibilityScheduleRequest, error) {
+	requestBody := graphmodels.NewPrivilegedAccessGroupEligibilityScheduleRequest()
+
+	accessId, err := convertRoleToAccessId(data.Role.ValueString())
+	if err != nil {
+		return nil, fmt.Errorf("unable to convert role to access ID: %w", err)
+	}
+
+	requestBody.SetAccessId(&accessId)
+
+	principalId := data.PrincipalID.ValueString()
+	requestBody.SetPrincipalId(&principalId)
+
+	groupId := data.Scope.ValueString()
+	requestBody.SetGroupId(&groupId)
+
+	action := graphmodels.ADMINASSIGN_SCHEDULEREQUESTACTIONS
+	requestBody.SetAction(&action)
+
+	scheduleInfo := graphmodels.NewRequestSchedule()
+	startDateTime, err := time.Parse(time.RFC3339, data.StartDateTime.ValueString())
+	if err != nil {
+		return nil, fmt.Errorf("unable to parse startDateTime: %w", err)
+	}
+
+	scheduleInfo.SetStartDateTime(&startDateTime)
+	expiration := graphmodels.NewExpirationPattern()
+	typ := graphmodels.NOEXPIRATION_EXPIRATIONPATTERNTYPE
+	expiration.SetTypeEscaped(&typ)
+
+	scheduleInfo.SetExpiration(expiration)
+	requestBody.SetScheduleInfo(scheduleInfo)
+	requestBody.SetJustification(toPtr(data.Justification.ValueString()))
+
+	return requestBody, nil
+}
+
+func convertRoleToAccessId(role string) (graphmodels.PrivilegedAccessGroupRelationships, error) {
+	switch role {
+	case "owner":
+		return graphmodels.OWNER_PRIVILEGEDACCESSGROUPRELATIONSHIPS, nil
+	case "member":
+		return graphmodels.MEMBER_PRIVILEGEDACCESSGROUPRELATIONSHIPS, nil
+	default:
+		return 0, fmt.Errorf("invalid role: %s", role)
+	}
+}
+
+func convertAccessIdToRole(accessId graphmodels.PrivilegedAccessGroupRelationships) (string, error) {
+	switch accessId {
+	case graphmodels.OWNER_PRIVILEGEDACCESSGROUPRELATIONSHIPS:
+		return "owner", nil
+	case graphmodels.MEMBER_PRIVILEGEDACCESSGROUPRELATIONSHIPS:
+		return "member", nil
+	default:
+		return "", fmt.Errorf("invalid accessId: %d", accessId)
+	}
+}
+
+func toPtr[T any](v T) *T {
+	return &v
 }

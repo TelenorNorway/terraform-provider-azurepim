@@ -8,7 +8,7 @@ import (
 	"flag"
 	"log"
 
-	"github.com/akselleirv/terraform-provider-azurepim/internal/provider"
+	"github.com/TelenorNorway/terraform-provider-azurepim/internal/provider"
 	"github.com/hashicorp/terraform-plugin-framework/providerserver"
 )
 
@@ -38,8 +38,7 @@ func main() {
 	flag.Parse()
 
 	opts := providerserver.ServeOpts{
-		// TODO: Update this string with the published name of your provider.
-		Address: "registry.terraform.io/akselleirv/azurepim",
+		Address: "registry.terraform.io/TelenorNorway/azurepim",
 		Debug:   debug,
 	}
 
