@@ -72,7 +72,7 @@ jobs:
           terraform_wrapper: false
 
       - name: Get Id Token from GitHub
-        uses: actions/github-script@v6
+        uses: actions/github-script@v7
         id: idtoken
         with:
           script: |
