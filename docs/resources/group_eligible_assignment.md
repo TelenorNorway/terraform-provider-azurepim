@@ -24,28 +24,9 @@ Manages an Entra Group PIM Eligible Role Assignment.
 ### Optional
 
 - `justification` (String) A message provided by users and administrators when they create an assignment.
-- `schedule` (Block, Optional) (see [below for nested schema](#nestedblock--schedule))
 
 ### Read-Only
 
-- `id` (String) Identifier
-- `status` (String)
-
-<a id="nestedblock--schedule"></a>
-### Nested Schema for `schedule`
-
-Required:
-
+- `id` (String) The ID of the resource is the targetScheduleId value.
 - `start_date_time` (String)
-
-Optional:
-
-- `expiration` (Block, Optional) (see [below for nested schema](#nestedblock--schedule--expiration))
-
-<a id="nestedblock--schedule--expiration"></a>
-### Nested Schema for `schedule.expiration`
-
-Required:
-
-- `end_date_time` (String)
-- `type` (String)
+- `status` (String)

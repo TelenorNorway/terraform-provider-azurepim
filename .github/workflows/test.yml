@@ -76,6 +76,7 @@ jobs:
         id: idtoken
         with:
           script: |
+            npm i @actions/core
             const c = require('@actions/core')
             const f = require('fs')
 
