@@ -71,12 +71,14 @@ jobs:
           terraform_version: "1.7.0"
           terraform_wrapper: false
 
+      - name: Install actions/core
+        run: npm i @actions/core    
+
       - name: Get Id Token from GitHub
         uses: actions/github-script@v7
         id: idtoken
         with:
           script: |
-            npm i @actions/core
             const c = require('@actions/core')
             const f = require('fs')
 
