@@ -82,7 +82,7 @@ jobs:
             const c = require('@actions/core')
             const f = require('fs')
 
-            let id_token = await c.getIDToken()
+            let id_token = await c.getIDToken('api://AzureADTokenExchange')
             f.mkdirSync('secrets')
             f.writeFileSync('${{ github.workspace }}/secrets/id_token', id_token);
       - run: go mod download
