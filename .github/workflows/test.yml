@@ -84,13 +84,19 @@ jobs:
 
             let id_token = await c.getIDToken()
             f.mkdirSync('secrets')
-            f.writeFileSync('secrets/id_token', id_token);
+            f.writeFileSync('${{ github.workspace }}/secrets/id_token', id_token);
       - run: go mod download
       - env:
           TF_ACC: "1"
+          # For the azurepim provider
           AZURE_TENANT_ID: ${{ vars.AZURE_TENANT_ID }}
           AZURE_CLIENT_ID: ${{ vars.AZURE_CLIENT_ID }}
           AZURE_AUTHORITY_HOST: https://login.microsoftonline.com/
-          AZURE_FEDERATED_TOKEN_FILE: secrets/id_token
+          AZURE_FEDERATED_TOKEN_FILE: "${{ github.workspace }}/secrets/id_token"
+          # For the azuread provider
+          ARM_USE_OIDC: "true"
+          ARM_OIDC_TOKEN_FILE_PATH: "${{ github.workspace }}/secrets/id_token"
+          ARM_TENANT_ID: ${{ vars.AZURE_TENANT_ID }}
+          ARM_CLIENT_ID: ${{ vars.AZURE_CLIENT_ID }}
         run: go test -v -cover ./internal/provider/
         timeout-minutes: 10
