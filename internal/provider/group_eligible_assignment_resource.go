@@ -4,10 +4,15 @@
 package provider
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
+	"io"
+	"net/http"
 	"time"
 
+	azcorepolicy "github.com/Azure/azure-sdk-for-go/sdk/azcore/policy"
 	"github.com/Azure/azure-sdk-for-go/sdk/azidentity"
 	"github.com/hashicorp/terraform-plugin-framework-validators/stringvalidator"
 	"github.com/hashicorp/terraform-plugin-framework/path"
@@ -18,9 +23,9 @@ import (
 	"github.com/hashicorp/terraform-plugin-framework/schema/validator"
 	"github.com/hashicorp/terraform-plugin-framework/types"
 	"github.com/hashicorp/terraform-plugin-log/tflog"
-	"github.com/microsoft/kiota-abstractions-go/serialization"
 	msgraphsdk "github.com/microsoftgraph/msgraph-beta-sdk-go"
 	graphmodels "github.com/microsoftgraph/msgraph-beta-sdk-go/models"
+	graphpolicies "github.com/microsoftgraph/msgraph-beta-sdk-go/policies"
 )
 
 // Ensure provider defined types fully satisfy framework interfaces.
@@ -133,6 +138,17 @@ func (r *GroupEligibleAssignment) Create(ctx context.Context, req resource.Creat
 
 	data.StartDateTime = types.StringValue(time.Now().Format(time.RFC3339))
 
+	policyId, err := r.getEligibleExpirationPolicyId(ctx, data.Scope.ValueString())
+	if err != nil {
+		resp.Diagnostics.AddError("Graph client error", "Unable to get eligible expiration policy ID: "+err.Error())
+		return
+	}
+
+	if err := r.updateUnifiedRoleManagementPolicyRule(ctx, policyId, false); err != nil {
+		resp.Diagnostics.AddError("Graph client error", "Unable to update unified role management policy rule: "+err.Error())
+		return
+	}
+
 	requestBody, err := newPrivilegedAccessGroupEligibilityScheduleRequest(data)
 	if err != nil {
 		resp.Diagnostics.AddError("Client Error", "Unable to create eligibility schedule requests: "+err.Error())
@@ -144,7 +160,7 @@ func (r *GroupEligibleAssignment) Create(ctx context.Context, req resource.Creat
 		PrivilegedAccess().
 		Group().
 		EligibilityScheduleRequests().
-		Post(context.Background(), requestBody, nil)
+		Post(ctx, requestBody, nil)
 	if err != nil {
 		resp.Diagnostics.AddError("Client Error", "Unable to create eligibility schedule requests: "+err.Error())
 		return
@@ -175,6 +191,114 @@ func (r *GroupEligibleAssignment) Create(ctx context.Context, req resource.Creat
 	resp.Diagnostics.Append(resp.State.Set(ctx, &data)...)
 }
 
+func (r *GroupEligibleAssignment) getEligibleExpirationPolicyId(ctx context.Context, scope string) (string, error) {
+	requestFilter := fmt.Sprintf("scopeId eq '%s' and scopeType eq 'Group' and roleDefinitionId eq 'member'", scope)
+
+	roleManagementPolicyAssignments, err := r.graphClient.
+		Policies().
+		RoleManagementPolicyAssignments().
+		Get(ctx, &graphpolicies.RoleManagementPolicyAssignmentsRequestBuilderGetRequestConfiguration{
+			QueryParameters: &graphpolicies.RoleManagementPolicyAssignmentsRequestBuilderGetQueryParameters{
+				Filter: &requestFilter,
+				Expand: []string{"policy($expand=rules)"},
+			},
+		})
+
+	if err != nil {
+		return "", fmt.Errorf("unable to get role management policy assignments: %w", err)
+	}
+
+	// Edit the policy group assignment and allow no expiration date for PIM eligible assignment
+	policyAssignments := roleManagementPolicyAssignments.GetValue()
+	if len(policyAssignments) == 0 {
+		return "", fmt.Errorf("unable to find role management policy assignments from result")
+	}
+
+	if len(policyAssignments) > 1 {
+		tflog.Warn(ctx, "found more than one role management policy assignment")
+	}
+
+	return *policyAssignments[0].GetPolicyId(), nil
+}
+
+// updateUnifiedRoleManagementPolicyRule had to be implemented without SDK because the SDK data model for this endpoint had several missing fields.
+func (r *GroupEligibleAssignment) updateUnifiedRoleManagementPolicyRule(ctx context.Context, policyId string, isExpirationRequired bool) error {
+
+	creds, err := azidentity.NewDefaultAzureCredential(nil)
+	if err != nil {
+		return fmt.Errorf("unable to create credentials: %w", err)
+	}
+
+	t, err := creds.GetToken(ctx, azcorepolicy.TokenRequestOptions{Scopes: []string{"https://graph.microsoft.com/.default"}})
+	if err != nil {
+		return fmt.Errorf("unable to get token: %w", err)
+	}
+
+	c := &http.Client{
+		Timeout: 10 * time.Second,
+	}
+
+	type target struct {
+		Caller              string   `json:"caller"`
+		Operations          []string `json:"operations"`
+		Level               string   `json:"level"`
+		InheritableSettings []any    `json:"inheritableSettings"`
+		EnforcedSettings    []any    `json:"enforcedSettings"`
+	}
+
+	type policyRule struct {
+		OdataType            string `json:"@odata.type"`
+		ID                   string `json:"id"`
+		IsExpirationRequired bool   `json:"isExpirationRequired"`
+		MaximumDuration      string `json:"maximumDuration"`
+		Target               target `json:"target"`
+	}
+
+	pr := policyRule{
+		OdataType:            "#microsoft.graph.unifiedRoleManagementPolicyExpirationRule",
+		ID:                   "Expiration_Admin_Eligibility",
+		IsExpirationRequired: isExpirationRequired,
+		MaximumDuration:      "P365D",
+		Target: target{
+			Caller:              "Admin",
+			Operations:          []string{"All"},
+			Level:               "Eligibility",
+			EnforcedSettings:    []any{},
+			InheritableSettings: []any{},
+		},
+	}
+
+	b, err := json.Marshal(pr)
+	if err != nil {
+		return fmt.Errorf("unable to marshal body: %w", err)
+	}
+
+	req, err := http.NewRequest(http.MethodPatch, fmt.Sprintf("https://graph.microsoft.com/beta/policies/roleManagementPolicies/%s/rules/Expiration_Admin_Eligibility", policyId), bytes.NewReader(b))
+	if err != nil {
+		return fmt.Errorf("unable to create request: %w", err)
+	}
+
+	req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", t.Token))
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := c.Do(req)
+	if err != nil {
+		return fmt.Errorf("unable to send request: %w", err)
+	}
+
+	if resp.StatusCode != http.StatusOK {
+		b, err := io.ReadAll(resp.Body)
+		if err != nil {
+			return fmt.Errorf("unable to read response body: %w", err)
+		}
+		defer req.Body.Close()
+
+		return fmt.Errorf("unable to update unified role management policy rule, got %d want %d: %s", resp.StatusCode, http.StatusOK, string(b))
+	}
+
+	return nil
+}
+
 func (r *GroupEligibleAssignment) Read(ctx context.Context, req resource.ReadRequest, resp *resource.ReadResponse) {
 	var data GroupEligibleAssignmentModel
 
@@ -191,7 +315,7 @@ func (r *GroupEligibleAssignment) Read(ctx context.Context, req resource.ReadReq
 		Group().
 		EligibilityScheduleRequests().
 		ByPrivilegedAccessGroupEligibilityScheduleRequestId(data.Id.ValueString()).
-		Get(context.Background(), nil)
+		Get(ctx, nil)
 	if err != nil {
 		resp.Diagnostics.AddError("Client call failed", "Unable to get eligibility schedule requests: "+err.Error())
 		return
@@ -262,6 +386,17 @@ func (r *GroupEligibleAssignment) Delete(ctx context.Context, req resource.Delet
 		resp.Diagnostics.AddError("Error deleting resource", "Unable to delete eligibility schedule request: "+err.Error())
 		return
 	}
+
+	policyId, err := r.getEligibleExpirationPolicyId(ctx, data.Scope.ValueString())
+	if err != nil {
+		resp.Diagnostics.AddError("Graph client error", "Unable to get eligible expiration policy ID: "+err.Error())
+		return
+	}
+
+	if err := r.updateUnifiedRoleManagementPolicyRule(ctx, policyId, true); err != nil {
+		resp.Diagnostics.AddError("Graph client error", "Unable to update unified role management policy rule: "+err.Error())
+		return
+	}
 }
 
 func (r *GroupEligibleAssignment) ImportState(ctx context.Context, req resource.ImportStateRequest, resp *resource.ImportStateResponse) {
@@ -295,10 +430,8 @@ func newPrivilegedAccessGroupEligibilityScheduleRequest(data GroupEligibleAssign
 
 	scheduleInfo.SetStartDateTime(&startDateTime)
 	expiration := graphmodels.NewExpirationPattern()
-	typ := graphmodels.AFTERDURATION_EXPIRATIONPATTERNTYPE
+	typ := graphmodels.NOEXPIRATION_EXPIRATIONPATTERNTYPE
 	expiration.SetTypeEscaped(&typ)
-	dur := 180 * 24 * time.Hour
-	expiration.SetDuration(serialization.FromDuration(dur))
 
 	scheduleInfo.SetExpiration(expiration)
 	requestBody.SetScheduleInfo(scheduleInfo)
