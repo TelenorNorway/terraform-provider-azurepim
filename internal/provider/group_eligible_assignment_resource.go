@@ -4,10 +4,15 @@
 package provider
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
+	"io"
+	"net/http"
 	"time"
 
+	azcorepolicy "github.com/Azure/azure-sdk-for-go/sdk/azcore/policy"
 	"github.com/Azure/azure-sdk-for-go/sdk/azidentity"
 	"github.com/hashicorp/terraform-plugin-framework-validators/stringvalidator"
 	"github.com/hashicorp/terraform-plugin-framework/path"
@@ -19,8 +24,8 @@ import (
 	"github.com/hashicorp/terraform-plugin-framework/types"
 	"github.com/hashicorp/terraform-plugin-log/tflog"
 	msgraphsdk "github.com/microsoftgraph/msgraph-beta-sdk-go"
-	"github.com/microsoftgraph/msgraph-beta-sdk-go/identitygovernance"
 	graphmodels "github.com/microsoftgraph/msgraph-beta-sdk-go/models"
+	graphpolicies "github.com/microsoftgraph/msgraph-beta-sdk-go/policies"
 )
 
 // Ensure provider defined types fully satisfy framework interfaces.
@@ -36,16 +41,6 @@ type GroupEligibleAssignment struct {
 	graphClient *msgraphsdk.GraphServiceClient
 }
 
-type Schedule struct {
-	StartDateTime types.String `tfsdk:"start_date_time"`
-	Expiration    Expiration   `tfsdk:"expiration"`
-}
-
-type Expiration struct {
-	Type        types.String `tfsdk:"type"`
-	EndDateTime types.String `tfsdk:"end_date_time"`
-}
-
 // GroupEligibleAssignmentModel describes the resource data model.
 type GroupEligibleAssignmentModel struct {
 	Id            types.String `tfsdk:"id"`
@@ -54,7 +49,7 @@ type GroupEligibleAssignmentModel struct {
 	Justification types.String `tfsdk:"justification"`
 	PrincipalID   types.String `tfsdk:"principal_id"`
 	Status        types.String `tfsdk:"status"`
-	Schedule      Schedule     `tfsdk:"schedule"`
+	StartDateTime types.String `tfsdk:"start_date_time"`
 }
 
 func (r *GroupEligibleAssignment) Metadata(ctx context.Context, req resource.MetadataRequest, resp *resource.MetadataResponse) {
@@ -64,12 +59,20 @@ func (r *GroupEligibleAssignment) Metadata(ctx context.Context, req resource.Met
 func (r *GroupEligibleAssignment) Schema(ctx context.Context, req resource.SchemaRequest, resp *resource.SchemaResponse) {
 	resp.Schema = schema.Schema{
 		// This description is used by the documentation generator and the language server.
-		MarkdownDescription: "Manages an Entra Group PIM Eligible Role Assignment.",
+		MarkdownDescription: `
+Enables PIM for an Entra group, manages an PIM Eligible Role Assignment and sets the PIM policy for the member role to allow for no expiration on eligible assignments.
+
+It requires the following graph permissions:
+- PrivilegedEligibilitySchedule.ReadWrite.AzureADGroup
+- RoleManagementPolicy.ReadWrite.AzureADGroup
+
+The resource does not support all the available configuration options for PIM Eligible Role Assignment for groups and its associated policy. 
+`,
 
 		Attributes: map[string]schema.Attribute{
 			"id": schema.StringAttribute{
 				Computed:            true,
-				MarkdownDescription: "Identifier",
+				MarkdownDescription: "The ID of the resource is the targetScheduleId value.",
 				PlanModifiers: []planmodifier.String{
 					stringplanmodifier.UseStateForUnknown(),
 				},
@@ -108,35 +111,8 @@ func (r *GroupEligibleAssignment) Schema(ctx context.Context, req resource.Schem
 			"status": schema.StringAttribute{
 				Computed: true,
 			},
-		},
-		Blocks: map[string]schema.Block{
-			"schedule": schema.SingleNestedBlock{
-				Attributes: map[string]schema.Attribute{
-					"start_date_time": schema.StringAttribute{
-						Required: true,
-						PlanModifiers: []planmodifier.String{
-							stringplanmodifier.RequiresReplace(),
-						},
-					},
-				},
-				Blocks: map[string]schema.Block{
-					"expiration": schema.SingleNestedBlock{
-						Attributes: map[string]schema.Attribute{
-							"type": schema.StringAttribute{
-								Required: true,
-								PlanModifiers: []planmodifier.String{
-									stringplanmodifier.RequiresReplace(),
-								},
-							},
-							"end_date_time": schema.StringAttribute{
-								Required: true,
-								PlanModifiers: []planmodifier.String{
-									stringplanmodifier.RequiresReplace(),
-								},
-							},
-						},
-					},
-				},
+			"start_date_time": schema.StringAttribute{
+				Computed: true,
 			},
 		},
 	}
@@ -168,60 +144,37 @@ func (r *GroupEligibleAssignment) Create(ctx context.Context, req resource.Creat
 		return
 	}
 
-	requestBody := graphmodels.NewPrivilegedAccessGroupEligibilityScheduleRequest()
+	data.StartDateTime = types.StringValue(time.Now().Format(time.RFC3339))
 
-	accessId := graphmodels.MEMBER_PRIVILEGEDACCESSGROUPRELATIONSHIPS
-	requestBody.SetAccessId(&accessId)
-
-	principalId := data.PrincipalID.ValueString()
-	requestBody.SetPrincipalId(&principalId)
-
-	groupId := data.Scope.ValueString()
-	requestBody.SetGroupId(&groupId)
-
-	action := graphmodels.ADMINASSIGN_SCHEDULEREQUESTACTIONS
-	requestBody.SetAction(&action)
-
-	scheduleInfo := graphmodels.NewRequestSchedule()
-	startDateTime, err := time.Parse(time.RFC3339, data.Schedule.StartDateTime.ValueString())
+	policyId, err := r.getEligibleExpirationPolicyId(ctx, data.Scope.ValueString())
 	if err != nil {
-		resp.Diagnostics.AddError("Client Error", "Unable to parse startDateTime")
-		return
-	}
-	scheduleInfo.SetStartDateTime(&startDateTime)
-	expiration := graphmodels.NewExpirationPattern()
-	typ := graphmodels.AFTERDATETIME_EXPIRATIONPATTERNTYPE
-	expiration.SetTypeEscaped(&typ)
-
-	endDateTime, err := time.Parse(time.RFC3339, data.Schedule.Expiration.EndDateTime.ValueString())
-	if err != nil {
-		resp.Diagnostics.AddError("Client Error", "Unable to parse endDateTime")
+		resp.Diagnostics.AddError("Graph client error", "Unable to get eligible expiration policy ID: "+err.Error())
 		return
 	}
 
-	expiration.SetEndDateTime(&endDateTime)
-	scheduleInfo.SetExpiration(expiration)
-	requestBody.SetScheduleInfo(scheduleInfo)
-	justification := "Assign eligible request."
-	requestBody.SetJustification(&justification)
+	if err := r.updateUnifiedRoleManagementPolicyRule(ctx, policyId, false); err != nil {
+		resp.Diagnostics.AddError("Graph client error", "Unable to update unified role management policy rule: "+err.Error())
+		return
+	}
+
+	requestBody, err := newPrivilegedAccessGroupEligibilityScheduleRequest(data)
+	if err != nil {
+		resp.Diagnostics.AddError("Client Error", "Unable to create eligibility schedule requests: "+err.Error())
+		return
+	}
 
 	eligibilityScheduleRequests, err := r.graphClient.
 		IdentityGovernance().
 		PrivilegedAccess().
 		Group().
 		EligibilityScheduleRequests().
-		Post(context.Background(), requestBody, nil)
+		Post(ctx, requestBody, nil)
 	if err != nil {
-		resp.Diagnostics.AddError("Client Error", "Unable to create eligibility schedule requests")
+		resp.Diagnostics.AddError("Client Error", "Unable to create eligibility schedule requests: "+err.Error())
 		return
 	}
 
-	id := eligibilityScheduleRequests.GetTargetScheduleId()
-	if id == nil {
-		resp.Diagnostics.AddError("Client Error", "Unable to get eligibility schedule requests ID")
-		return
-	}
-	data.Id = types.StringValue(*id)
+	data.Id = types.StringValue(*eligibilityScheduleRequests.GetId())
 
 	status := eligibilityScheduleRequests.GetStatus()
 	if status == nil {
@@ -229,11 +182,129 @@ func (r *GroupEligibleAssignment) Create(ctx context.Context, req resource.Creat
 		return
 	}
 	data.Status = types.StringValue(*status)
+	data.Justification = types.StringValue(*eligibilityScheduleRequests.GetJustification())
+	data.PrincipalID = types.StringValue(*eligibilityScheduleRequests.GetPrincipalId())
+	role, err := convertAccessIdToRole(*eligibilityScheduleRequests.GetAccessId())
+	if err != nil {
+		resp.Diagnostics.AddError("Client Error", "Unable to convert access ID to role: "+err.Error())
+		return
+	}
+	data.Role = types.StringValue(role)
+	data.Scope = types.StringValue(*eligibilityScheduleRequests.GetGroupId())
+	data.StartDateTime = types.StringValue(eligibilityScheduleRequests.GetScheduleInfo().GetStartDateTime().Format(time.RFC3339))
 
 	tflog.Trace(ctx, "created a resource")
 
 	// Save data into Terraform state
 	resp.Diagnostics.Append(resp.State.Set(ctx, &data)...)
+}
+
+func (r *GroupEligibleAssignment) getEligibleExpirationPolicyId(ctx context.Context, scope string) (string, error) {
+	requestFilter := fmt.Sprintf("scopeId eq '%s' and scopeType eq 'Group' and roleDefinitionId eq 'member'", scope)
+
+	roleManagementPolicyAssignments, err := r.graphClient.
+		Policies().
+		RoleManagementPolicyAssignments().
+		Get(ctx, &graphpolicies.RoleManagementPolicyAssignmentsRequestBuilderGetRequestConfiguration{
+			QueryParameters: &graphpolicies.RoleManagementPolicyAssignmentsRequestBuilderGetQueryParameters{
+				Filter: &requestFilter,
+				Expand: []string{"policy($expand=rules)"},
+			},
+		})
+
+	if err != nil {
+		return "", fmt.Errorf("unable to get role management policy assignments: %w", err)
+	}
+
+	// Edit the policy group assignment and allow no expiration date for PIM eligible assignment
+	policyAssignments := roleManagementPolicyAssignments.GetValue()
+	if len(policyAssignments) == 0 {
+		return "", fmt.Errorf("unable to find role management policy assignments from result")
+	}
+
+	if len(policyAssignments) > 1 {
+		tflog.Warn(ctx, "found more than one role management policy assignment")
+	}
+
+	return *policyAssignments[0].GetPolicyId(), nil
+}
+
+// updateUnifiedRoleManagementPolicyRule had to be implemented without SDK because the SDK data model for this endpoint had several missing fields.
+func (r *GroupEligibleAssignment) updateUnifiedRoleManagementPolicyRule(ctx context.Context, policyId string, isExpirationRequired bool) error {
+
+	creds, err := azidentity.NewDefaultAzureCredential(nil)
+	if err != nil {
+		return fmt.Errorf("unable to create credentials: %w", err)
+	}
+
+	t, err := creds.GetToken(ctx, azcorepolicy.TokenRequestOptions{Scopes: []string{"https://graph.microsoft.com/.default"}})
+	if err != nil {
+		return fmt.Errorf("unable to get token: %w", err)
+	}
+
+	c := &http.Client{
+		Timeout: 10 * time.Second,
+	}
+
+	type target struct {
+		Caller              string   `json:"caller"`
+		Operations          []string `json:"operations"`
+		Level               string   `json:"level"`
+		InheritableSettings []any    `json:"inheritableSettings"`
+		EnforcedSettings    []any    `json:"enforcedSettings"`
+	}
+
+	type policyRule struct {
+		OdataType            string `json:"@odata.type"`
+		ID                   string `json:"id"`
+		IsExpirationRequired bool   `json:"isExpirationRequired"`
+		MaximumDuration      string `json:"maximumDuration"`
+		Target               target `json:"target"`
+	}
+
+	pr := policyRule{
+		OdataType:            "#microsoft.graph.unifiedRoleManagementPolicyExpirationRule",
+		ID:                   "Expiration_Admin_Eligibility",
+		IsExpirationRequired: isExpirationRequired,
+		MaximumDuration:      "P365D",
+		Target: target{
+			Caller:              "Admin",
+			Operations:          []string{"All"},
+			Level:               "Eligibility",
+			EnforcedSettings:    []any{},
+			InheritableSettings: []any{},
+		},
+	}
+
+	b, err := json.Marshal(pr)
+	if err != nil {
+		return fmt.Errorf("unable to marshal body: %w", err)
+	}
+
+	req, err := http.NewRequest(http.MethodPatch, fmt.Sprintf("https://graph.microsoft.com/beta/policies/roleManagementPolicies/%s/rules/Expiration_Admin_Eligibility", policyId), bytes.NewReader(b))
+	if err != nil {
+		return fmt.Errorf("unable to create request: %w", err)
+	}
+
+	req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", t.Token))
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := c.Do(req)
+	if err != nil {
+		return fmt.Errorf("unable to send request: %w", err)
+	}
+
+	if resp.StatusCode != http.StatusOK {
+		b, err := io.ReadAll(resp.Body)
+		if err != nil {
+			return fmt.Errorf("unable to read response body: %w", err)
+		}
+		defer req.Body.Close()
+
+		return fmt.Errorf("unable to update unified role management policy rule, got %d want %d: %s", resp.StatusCode, http.StatusOK, string(b))
+	}
+
+	return nil
 }
 
 func (r *GroupEligibleAssignment) Read(ctx context.Context, req resource.ReadRequest, resp *resource.ReadResponse) {
@@ -246,29 +317,32 @@ func (r *GroupEligibleAssignment) Read(ctx context.Context, req resource.ReadReq
 		return
 	}
 
-	requestFilter := fmt.Sprintf(
-		"groupId eq '%s' and principalId eq '%s' and accessId eq '%s'",
-		data.Scope.ValueString(),
-		data.PrincipalID.ValueString(),
-		data.Role.ValueString(),
-	)
-
 	groupEligibleResp, err := r.graphClient.
 		IdentityGovernance().
 		PrivilegedAccess().
 		Group().
 		EligibilityScheduleRequests().
-		Get(context.Background(), &identitygovernance.PrivilegedAccessGroupEligibilityScheduleRequestsRequestBuilderGetRequestConfiguration{
-			QueryParameters: &identitygovernance.PrivilegedAccessGroupEligibilityScheduleRequestsRequestBuilderGetQueryParameters{
-				Filter: &requestFilter,
-			},
-		})
+		ByPrivilegedAccessGroupEligibilityScheduleRequestId(data.Id.ValueString()).
+		Get(ctx, nil)
 	if err != nil {
-		resp.Diagnostics.AddError("Client Error", "Unable to get eligibility schedule requests")
+		resp.Diagnostics.AddError("Client call failed", "Unable to get eligibility schedule requests: "+err.Error())
 		return
 	}
 
-	fmt.Println("read response", groupEligibleResp)
+	data.Id = types.StringValue(*groupEligibleResp.GetId())
+	data.Justification = types.StringValue(*groupEligibleResp.GetJustification())
+	data.Status = types.StringValue(*groupEligibleResp.GetStatus())
+	data.PrincipalID = types.StringValue(*groupEligibleResp.GetPrincipalId())
+
+	role, err := convertAccessIdToRole(*groupEligibleResp.GetAccessId())
+	if err != nil {
+		resp.Diagnostics.AddError("Conversion failed", "Unable to convert access ID to role: "+err.Error())
+		return
+	}
+	data.Role = types.StringValue(role)
+
+	data.Scope = types.StringValue(*groupEligibleResp.GetGroupId())
+	data.StartDateTime = types.StringValue(groupEligibleResp.GetScheduleInfo().GetStartDateTime().Format(time.RFC3339))
 
 	// Save updated data into Terraform state
 	resp.Diagnostics.Append(resp.State.Set(ctx, &data)...)
@@ -284,7 +358,7 @@ func (r *GroupEligibleAssignment) Update(ctx context.Context, req resource.Updat
 		return
 	}
 
-	tflog.Error(ctx, "update not implemented")
+	tflog.Info(ctx, "resource can only be replaced")
 
 	// Save updated data into Terraform state
 	resp.Diagnostics.Append(resp.State.Set(ctx, &data)...)
@@ -300,9 +374,102 @@ func (r *GroupEligibleAssignment) Delete(ctx context.Context, req resource.Delet
 		return
 	}
 
-	tflog.Error(ctx, "delete not implemented")
+	requestBody, err := newPrivilegedAccessGroupEligibilityScheduleRequest(data)
+	if err != nil {
+		resp.Diagnostics.AddError("Error deleting resource", "Unable to create eligibility schedule request: "+err.Error())
+		return
+	}
+
+	requestBody.SetAction(toPtr(graphmodels.ADMINREMOVE_SCHEDULEREQUESTACTIONS))
+	requestBody.SetId(toPtr(data.Id.ValueString()))
+
+	_, err = r.graphClient.
+		IdentityGovernance().
+		PrivilegedAccess().
+		Group().
+		EligibilityScheduleRequests().
+		Post(ctx, requestBody, nil)
+
+	if err != nil {
+		resp.Diagnostics.AddError("Error deleting resource", "Unable to delete eligibility schedule request: "+err.Error())
+		return
+	}
+
+	policyId, err := r.getEligibleExpirationPolicyId(ctx, data.Scope.ValueString())
+	if err != nil {
+		resp.Diagnostics.AddError("Graph client error", "Unable to get eligible expiration policy ID: "+err.Error())
+		return
+	}
+
+	if err := r.updateUnifiedRoleManagementPolicyRule(ctx, policyId, true); err != nil {
+		resp.Diagnostics.AddError("Graph client error", "Unable to update unified role management policy rule: "+err.Error())
+		return
+	}
 }
 
 func (r *GroupEligibleAssignment) ImportState(ctx context.Context, req resource.ImportStateRequest, resp *resource.ImportStateResponse) {
 	resource.ImportStatePassthroughID(ctx, path.Root("id"), req, resp)
+}
+
+func newPrivilegedAccessGroupEligibilityScheduleRequest(data GroupEligibleAssignmentModel) (*graphmodels.PrivilegedAccessGroupEligibilityScheduleRequest, error) {
+	requestBody := graphmodels.NewPrivilegedAccessGroupEligibilityScheduleRequest()
+
+	accessId, err := convertRoleToAccessId(data.Role.ValueString())
+	if err != nil {
+		return nil, fmt.Errorf("unable to convert role to access ID: %w", err)
+	}
+
+	requestBody.SetAccessId(&accessId)
+
+	principalId := data.PrincipalID.ValueString()
+	requestBody.SetPrincipalId(&principalId)
+
+	groupId := data.Scope.ValueString()
+	requestBody.SetGroupId(&groupId)
+
+	action := graphmodels.ADMINASSIGN_SCHEDULEREQUESTACTIONS
+	requestBody.SetAction(&action)
+
+	scheduleInfo := graphmodels.NewRequestSchedule()
+	startDateTime, err := time.Parse(time.RFC3339, data.StartDateTime.ValueString())
+	if err != nil {
+		return nil, fmt.Errorf("unable to parse startDateTime: %w", err)
+	}
+
+	scheduleInfo.SetStartDateTime(&startDateTime)
+	expiration := graphmodels.NewExpirationPattern()
+	typ := graphmodels.NOEXPIRATION_EXPIRATIONPATTERNTYPE
+	expiration.SetTypeEscaped(&typ)
+
+	scheduleInfo.SetExpiration(expiration)
+	requestBody.SetScheduleInfo(scheduleInfo)
+	requestBody.SetJustification(toPtr(data.Justification.ValueString()))
+
+	return requestBody, nil
+}
+
+func convertRoleToAccessId(role string) (graphmodels.PrivilegedAccessGroupRelationships, error) {
+	switch role {
+	case "owner":
+		return graphmodels.OWNER_PRIVILEGEDACCESSGROUPRELATIONSHIPS, nil
+	case "member":
+		return graphmodels.MEMBER_PRIVILEGEDACCESSGROUPRELATIONSHIPS, nil
+	default:
+		return 0, fmt.Errorf("invalid role: %s", role)
+	}
+}
+
+func convertAccessIdToRole(accessId graphmodels.PrivilegedAccessGroupRelationships) (string, error) {
+	switch accessId {
+	case graphmodels.OWNER_PRIVILEGEDACCESSGROUPRELATIONSHIPS:
+		return "owner", nil
+	case graphmodels.MEMBER_PRIVILEGEDACCESSGROUPRELATIONSHIPS:
+		return "member", nil
+	default:
+		return "", fmt.Errorf("invalid accessId: %d", accessId)
+	}
+}
+
+func toPtr[T any](v T) *T {
+	return &v
 }

@@ -8,12 +8,15 @@ on:
     paths-ignore:
       - 'README.md'
   push:
+    branches:
+      - main
     paths-ignore:
       - 'README.md'
 
 # Testing only needs permissions to read the repository contents.
 permissions:
   contents: read
+  id-token: write # Required for Azure federated identities
 
 jobs:
   # Ensure project builds before running testing matrix
@@ -53,17 +56,12 @@ jobs:
     name: Terraform Provider Acceptance Tests
     needs: build
     runs-on: ubuntu-latest
+    environment: terraform-test
+    concurrency: 
+      group: terraform-test
     timeout-minutes: 15
     strategy:
       fail-fast: false
-      matrix:
-        # list whatever Terraform versions here you would like to support
-        terraform:
-          - '1.0.*'
-          - '1.1.*'
-          - '1.2.*'
-          - '1.3.*'
-          - '1.4.*'
     steps:
       - uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11 # v4.1.1
       - uses: actions/setup-go@0c52d547c9bc32b1aa3301fd7a9cb496313a4491 # v5.0.0
@@ -72,10 +70,35 @@ jobs:
           cache: true
       - uses: hashicorp/setup-terraform@633666f66e0061ca3b725c73b2ec20cd13a8fdd1 # v2.0.3
         with:
-          terraform_version: ${{ matrix.terraform }}
+          terraform_version: "1.7.0"
           terraform_wrapper: false
+
+      - name: Install actions/core
+        run: npm i @actions/core    
+
+      - name: Get Id Token from GitHub
+        uses: actions/github-script@v7
+        id: idtoken
+        with:
+          script: |
+            const c = require('@actions/core')
+            const f = require('fs')
+
+            let id_token = await c.getIDToken('api://AzureADTokenExchange')
+            f.mkdirSync('secrets')
+            f.writeFileSync('${{ github.workspace }}/secrets/id_token', id_token);
       - run: go mod download
       - env:
           TF_ACC: "1"
+          # For the azurepim provider
+          AZURE_TENANT_ID: ${{ vars.AZURE_TENANT_ID }}
+          AZURE_CLIENT_ID: ${{ vars.AZURE_CLIENT_ID }}
+          AZURE_AUTHORITY_HOST: https://login.microsoftonline.com/
+          AZURE_FEDERATED_TOKEN_FILE: "${{ github.workspace }}/secrets/id_token"
+          # For the azuread provider
+          ARM_USE_OIDC: "true"
+          ARM_OIDC_TOKEN_FILE_PATH: "${{ github.workspace }}/secrets/id_token"
+          ARM_TENANT_ID: ${{ vars.AZURE_TENANT_ID }}
+          ARM_CLIENT_ID: ${{ vars.AZURE_CLIENT_ID }}
         run: go test -v -cover ./internal/provider/
         timeout-minutes: 10
