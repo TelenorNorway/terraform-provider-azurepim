@@ -28,6 +28,9 @@ func TestAccGroupEligibleAssignmentResource(t *testing.T) {
 	})
 }
 
+// testAccGroupEligibleAssignmentConfig the config requires the following graph permissions in addition to the ones required by the azurepim_group_eligible_assignment resource:
+// - RoleManagement.ReadWrite.Directory.
+// - Group.Create.
 func testAccGroupEligibleAssignmentConfig() string {
 	return `
 data "azuread_client_config" "current" {}
@@ -43,13 +46,12 @@ resource "azuread_group" "pag" {
 	owners             = [data.azuread_client_config.current.object_id]
 	security_enabled   = true
 	assignable_to_role = true
-  }
+}
 
 resource "azurepim_group_eligible_assignment" "test" {
 	role          = "member"
 	scope         = azuread_group.pag.object_id
 	justification = "this is a test"
 	principal_id  = azuread_group.main.object_id
-}
-`
+}`
 }

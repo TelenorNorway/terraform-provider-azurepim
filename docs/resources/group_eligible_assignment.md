@@ -3,12 +3,22 @@
 page_title: "azurepim_group_eligible_assignment Resource - terraform-provider-azurepim"
 subcategory: ""
 description: |-
-  Manages an Entra Group PIM Eligible Role Assignment.
+  Enables PIM for an Entra group, manages an PIM Eligible Role Assignment and sets the PIM policy for the member role to allow for no expiration on eligible assignments.
+  It requires the following graph permissions:
+  - PrivilegedEligibilitySchedule.ReadWrite.AzureADGroup
+  - RoleManagementPolicy.ReadWrite.AzureADGroup
+  The resource does not support all the available configuration options for PIM Eligible Role Assignment for groups and its associated policy.
 ---
 
 # azurepim_group_eligible_assignment (Resource)
 
-Manages an Entra Group PIM Eligible Role Assignment.
+Enables PIM for an Entra group, manages an PIM Eligible Role Assignment and sets the PIM policy for the member role to allow for no expiration on eligible assignments.
+
+It requires the following graph permissions:
+- PrivilegedEligibilitySchedule.ReadWrite.AzureADGroup
+- RoleManagementPolicy.ReadWrite.AzureADGroup
+
+The resource does not support all the available configuration options for PIM Eligible Role Assignment for groups and its associated policy.
 
 
 

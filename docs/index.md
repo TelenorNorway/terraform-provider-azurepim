@@ -3,12 +3,15 @@
 page_title: "azurepim Provider"
 subcategory: ""
 description: |-
-  The Azure PIM provider was built as PIM group eligible assignment is as of writing not supported in the official azurerm provider.
+  The Azure PIM provider was built as PIM group eligible assignment is as of writing not supported in the official azuread provider.
+  Please note that this provider uses a beta API provided by Microsoft Graph and is subject to change at any time.
 ---
 
 # azurepim Provider
 
-The Azure PIM provider was built as PIM group eligible assignment is as of writing not supported in the official azurerm provider.
+The Azure PIM provider was built as PIM group eligible assignment is as of writing not supported in the official azuread provider.
+
+Please note that this provider uses a beta API provided by Microsoft Graph and is subject to change at any time.
 
 ## Example Usage
 

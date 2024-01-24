@@ -35,7 +35,11 @@ func (p *AzurepimProvider) Metadata(ctx context.Context, req provider.MetadataRe
 
 func (p *AzurepimProvider) Schema(ctx context.Context, req provider.SchemaRequest, resp *provider.SchemaResponse) {
 	resp.Schema = schema.Schema{
-		MarkdownDescription: "The Azure PIM provider was built as PIM group eligible assignment is as of writing not supported in the official azurerm provider.",
+		MarkdownDescription: `
+The Azure PIM provider was built as PIM group eligible assignment is as of writing not supported in the official azuread provider.
+
+Please note that this provider uses a beta API provided by Microsoft Graph and is subject to change at any time.
+`,
 	}
 }
 

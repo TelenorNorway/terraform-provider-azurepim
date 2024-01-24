@@ -59,7 +59,15 @@ func (r *GroupEligibleAssignment) Metadata(ctx context.Context, req resource.Met
 func (r *GroupEligibleAssignment) Schema(ctx context.Context, req resource.SchemaRequest, resp *resource.SchemaResponse) {
 	resp.Schema = schema.Schema{
 		// This description is used by the documentation generator and the language server.
-		MarkdownDescription: "Manages an Entra Group PIM Eligible Role Assignment.",
+		MarkdownDescription: `
+Enables PIM for an Entra group, manages an PIM Eligible Role Assignment and sets the PIM policy for the member role to allow for no expiration on eligible assignments.
+
+It requires the following graph permissions:
+- PrivilegedEligibilitySchedule.ReadWrite.AzureADGroup
+- RoleManagementPolicy.ReadWrite.AzureADGroup
+
+The resource does not support all the available configuration options for PIM Eligible Role Assignment for groups and its associated policy. 
+`,
 
 		Attributes: map[string]schema.Attribute{
 			"id": schema.StringAttribute{
