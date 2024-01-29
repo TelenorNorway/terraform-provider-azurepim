@@ -45,7 +45,6 @@ resource "azuread_group" "pag" {
 	display_name       = "azurepim-acc-test-group-pag"
 	owners             = [data.azuread_client_config.current.object_id]
 	security_enabled   = true
-	assignable_to_role = true
 }
 
 resource "azurepim_group_eligible_assignment" "test" {
