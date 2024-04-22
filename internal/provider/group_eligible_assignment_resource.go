@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strings"
 	"time"
 
 	azcorepolicy "github.com/Azure/azure-sdk-for-go/sdk/azcore/policy"
@@ -24,6 +25,7 @@ import (
 	"github.com/hashicorp/terraform-plugin-framework/types"
 	"github.com/hashicorp/terraform-plugin-log/tflog"
 	msgraphsdk "github.com/microsoftgraph/msgraph-beta-sdk-go"
+	"github.com/microsoftgraph/msgraph-beta-sdk-go/identitygovernance"
 	graphmodels "github.com/microsoftgraph/msgraph-beta-sdk-go/models"
 	graphpolicies "github.com/microsoftgraph/msgraph-beta-sdk-go/policies"
 )
@@ -43,13 +45,14 @@ type GroupEligibleAssignment struct {
 
 // GroupEligibleAssignmentModel describes the resource data model.
 type GroupEligibleAssignmentModel struct {
-	Id            types.String `tfsdk:"id"`
-	Role          types.String `tfsdk:"role"`
-	Scope         types.String `tfsdk:"scope"`
-	Justification types.String `tfsdk:"justification"`
-	PrincipalID   types.String `tfsdk:"principal_id"`
-	Status        types.String `tfsdk:"status"`
-	StartDateTime types.String `tfsdk:"start_date_time"`
+	Id                   types.String `tfsdk:"id"`
+	Role                 types.String `tfsdk:"role"`
+	Scope                types.String `tfsdk:"scope"`
+	Justification        types.String `tfsdk:"justification"`
+	PrincipalID          types.String `tfsdk:"principal_id"`
+	Status               types.String `tfsdk:"status"`
+	StartDateTime        types.String `tfsdk:"start_date_time"`
+	EligibleAssignmentID types.String `tfsdk:"eligible_assignment_id"`
 }
 
 func (r *GroupEligibleAssignment) Metadata(ctx context.Context, req resource.MetadataRequest, resp *resource.MetadataResponse) {
@@ -72,7 +75,7 @@ The resource does not support all the available configuration options for PIM El
 		Attributes: map[string]schema.Attribute{
 			"id": schema.StringAttribute{
 				Computed:            true,
-				MarkdownDescription: "The ID of the resource is the targetScheduleId value.",
+				MarkdownDescription: "The ID of the resource is the '{scope}|{principal_id}' value.",
 				PlanModifiers: []planmodifier.String{
 					stringplanmodifier.UseStateForUnknown(),
 				},
@@ -113,6 +116,10 @@ The resource does not support all the available configuration options for PIM El
 			},
 			"start_date_time": schema.StringAttribute{
 				Computed: true,
+			},
+			"eligible_assignment_id": schema.StringAttribute{
+				Computed:            true,
+				MarkdownDescription: "The ID of the eligibility schedule request.",
 			},
 		},
 	}
@@ -174,7 +181,7 @@ func (r *GroupEligibleAssignment) Create(ctx context.Context, req resource.Creat
 		return
 	}
 
-	data.Id = types.StringValue(*eligibilityScheduleRequests.GetId())
+	data.Id = types.StringValue(fmt.Sprintf("%s|%s", *eligibilityScheduleRequests.GetGroupId(), *eligibilityScheduleRequests.GetPrincipalId()))
 
 	status := eligibilityScheduleRequests.GetStatus()
 	if status == nil {
@@ -192,6 +199,7 @@ func (r *GroupEligibleAssignment) Create(ctx context.Context, req resource.Creat
 	data.Role = types.StringValue(role)
 	data.Scope = types.StringValue(*eligibilityScheduleRequests.GetGroupId())
 	data.StartDateTime = types.StringValue(eligibilityScheduleRequests.GetScheduleInfo().GetStartDateTime().Format(time.RFC3339))
+	data.EligibleAssignmentID = types.StringValue(*eligibilityScheduleRequests.GetId())
 
 	tflog.Trace(ctx, "created a resource")
 
@@ -317,32 +325,59 @@ func (r *GroupEligibleAssignment) Read(ctx context.Context, req resource.ReadReq
 		return
 	}
 
+	idSplit := strings.Split(data.Id.ValueString(), "|")
+	if len(idSplit) != 2 {
+		resp.Diagnostics.AddError("Invalid ID", "ID must be in the format '{scope}|{principal_id}'")
+		return
+	}
+
+	scope, principalID := idSplit[0], idSplit[1]
+	filter := toPtr(fmt.Sprintf("groupId eq '%s' and principalId eq '%s'", scope, principalID))
 	groupEligibleResp, err := r.graphClient.
 		IdentityGovernance().
 		PrivilegedAccess().
 		Group().
 		EligibilityScheduleRequests().
-		ByPrivilegedAccessGroupEligibilityScheduleRequestId(data.Id.ValueString()).
-		Get(ctx, nil)
+		Get(ctx, &identitygovernance.PrivilegedAccessGroupEligibilityScheduleRequestsRequestBuilderGetRequestConfiguration{
+			QueryParameters: &identitygovernance.PrivilegedAccessGroupEligibilityScheduleRequestsRequestBuilderGetQueryParameters{
+				Filter: filter,
+			},
+		})
 	if err != nil {
-		resp.Diagnostics.AddError("Client call failed", "Unable to get eligibility schedule requests: "+err.Error())
+		resp.Diagnostics.AddError("Client call failed", fmt.Sprintf("Unable to get eligibility schedule requests with filter '%s': %s", *filter, err.Error()))
 		return
 	}
 
-	data.Id = types.StringValue(*groupEligibleResp.GetId())
-	data.Justification = types.StringValue(*groupEligibleResp.GetJustification())
-	data.Status = types.StringValue(*groupEligibleResp.GetStatus())
-	data.PrincipalID = types.StringValue(*groupEligibleResp.GetPrincipalId())
+	groupEligibles := groupEligibleResp.GetValue()
+	var groupEligibleProvisioned []graphmodels.PrivilegedAccessGroupEligibilityScheduleRequestable
+	for _, groupEligible := range groupEligibles {
+		// The list can return multiple results, but we can remove old assignments which might have status like "Revoked".
+		if *groupEligible.GetStatus() == "Provisioned" {
+			groupEligibleProvisioned = append(groupEligibleProvisioned, groupEligible)
+		}
+	}
 
-	role, err := convertAccessIdToRole(*groupEligibleResp.GetAccessId())
+	if len(groupEligibleProvisioned) != 1 {
+		resp.Diagnostics.AddError("Client call failed", fmt.Sprintf("Got %d results, want 1", len(groupEligibles)))
+		return
+	}
+
+	groupEligible := groupEligibleProvisioned[0]
+
+	data.EligibleAssignmentID = types.StringValue(*groupEligible.GetId())
+	data.Justification = types.StringValue(*groupEligible.GetJustification())
+	data.Status = types.StringValue(*groupEligible.GetStatus())
+	data.PrincipalID = types.StringValue(*groupEligible.GetPrincipalId())
+
+	role, err := convertAccessIdToRole(*groupEligible.GetAccessId())
 	if err != nil {
 		resp.Diagnostics.AddError("Conversion failed", "Unable to convert access ID to role: "+err.Error())
 		return
 	}
 	data.Role = types.StringValue(role)
 
-	data.Scope = types.StringValue(*groupEligibleResp.GetGroupId())
-	data.StartDateTime = types.StringValue(groupEligibleResp.GetScheduleInfo().GetStartDateTime().Format(time.RFC3339))
+	data.Scope = types.StringValue(*groupEligible.GetGroupId())
+	data.StartDateTime = types.StringValue(groupEligible.GetScheduleInfo().GetStartDateTime().Format(time.RFC3339))
 
 	// Save updated data into Terraform state
 	resp.Diagnostics.Append(resp.State.Set(ctx, &data)...)
@@ -381,7 +416,7 @@ func (r *GroupEligibleAssignment) Delete(ctx context.Context, req resource.Delet
 	}
 
 	requestBody.SetAction(toPtr(graphmodels.ADMINREMOVE_SCHEDULEREQUESTACTIONS))
-	requestBody.SetId(toPtr(data.Id.ValueString()))
+	requestBody.SetId(toPtr(data.EligibleAssignmentID.ValueString()))
 
 	_, err = r.graphClient.
 		IdentityGovernance().

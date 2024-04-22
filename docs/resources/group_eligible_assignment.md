@@ -37,6 +37,7 @@ The resource does not support all the available configuration options for PIM El
 
 ### Read-Only
 
-- `id` (String) The ID of the resource is the targetScheduleId value.
+- `eligible_assignment_id` (String) The ID of the eligibility schedule request.
+- `id` (String) The ID of the resource is the '{scope}|{principal_id}' value.
 - `start_date_time` (String)
 - `status` (String)
