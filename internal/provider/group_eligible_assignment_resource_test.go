@@ -24,6 +24,12 @@ func TestAccGroupEligibleAssignmentResource(t *testing.T) {
 					resource.TestCheckResourceAttr("azurepim_group_eligible_assignment.test", "role", "member"),
 				),
 			},
+			// ImportState testing
+			{
+				ResourceName:      "azurepim_group_eligible_assignment.test",
+				ImportState:       true,
+				ImportStateVerify: true,
+			},
 		},
 	})
 }
