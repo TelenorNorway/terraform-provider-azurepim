@@ -199,6 +199,7 @@ func (r *GroupEligibleAssignment) Create(ctx context.Context, req resource.Creat
 	data.Role = types.StringValue(role)
 	data.Scope = types.StringValue(*eligibilityScheduleRequests.GetGroupId())
 	data.StartDateTime = types.StringValue(eligibilityScheduleRequests.GetScheduleInfo().GetStartDateTime().Format(time.RFC3339))
+	data.EligibleAssignmentID = types.StringValue(*eligibilityScheduleRequests.GetId())
 
 	tflog.Trace(ctx, "created a resource")
 
@@ -348,11 +349,20 @@ func (r *GroupEligibleAssignment) Read(ctx context.Context, req resource.ReadReq
 	}
 
 	groupEligibles := groupEligibleResp.GetValue()
-	if len(groupEligibles) != 1 {
+	var groupEligibleProvisioned []graphmodels.PrivilegedAccessGroupEligibilityScheduleRequestable
+	for _, groupEligible := range groupEligibles {
+		// The list can return multiple results, but we can remove old assignments which might have status like "Revoked".
+		if *groupEligible.GetStatus() == "Provisioned" {
+			groupEligibleProvisioned = append(groupEligibleProvisioned, groupEligible)
+		}
+	}
+
+	if len(groupEligibleProvisioned) != 1 {
 		resp.Diagnostics.AddError("Client call failed", fmt.Sprintf("Got %d results, want 1", len(groupEligibles)))
 		return
 	}
-	groupEligible := groupEligibles[0]
+
+	groupEligible := groupEligibleProvisioned[0]
 
 	data.EligibleAssignmentID = types.StringValue(*groupEligible.GetId())
 	data.Justification = types.StringValue(*groupEligible.GetJustification())
